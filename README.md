@@ -294,6 +294,7 @@ cd ../..
 cargo fmt --all -- --check
 cargo test
 cargo build --release
+BINARY_DIR="$PWD/target/aarch64-apple-darwin/release" bash scripts/installer/macos/package-dmg.sh 1.2.37 arm64
 ```
 
 主要结构：

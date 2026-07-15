@@ -245,6 +245,21 @@ fn chat_completion_to_response_with_context(
         .get("message")
         .ok_or_else(|| anyhow::anyhow!("chat response choice missing message"))?;
 
+    if let Some(sig) = message.get("thoughtSignature").or_else(|| message.get("signature")).and_then(Value::as_str) {
+        if let Some(content) = message.get("content").and_then(Value::as_str) {
+            cache_thought_signature(&text_content_key(content), sig);
+        }
+    }
+    if let Some(tool_calls) = message.get("tool_calls").and_then(Value::as_array) {
+        for tool_call in tool_calls {
+            if let Some(call_id) = tool_call.get("id").and_then(Value::as_str) {
+                if let Some(sig) = tool_call.get("thoughtSignature").or_else(|| tool_call.get("signature")).and_then(Value::as_str) {
+                    cache_thought_signature(call_id, sig);
+                }
+            }
+        }
+    }
+
     let response_id = response_id_from_chat_id(body.get("id").and_then(Value::as_str));
     let mut output = Vec::new();
     if let Some(reasoning) = chat_reasoning_to_response_output_item(message, &response_id) {
@@ -963,6 +978,7 @@ struct TextItemState {
     text: String,
     added: bool,
     done: bool,
+    thought_signature: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -997,6 +1013,7 @@ struct ToolCallState {
     arguments: String,
     added: bool,
     done: bool,
+    thought_signature: Option<String>,
 }
 
 #[derive(Debug)]
@@ -1076,6 +1093,12 @@ impl ChatSseState {
         };
 
         if let Some(delta) = choice.get("delta") {
+            if let Some(sig) = delta.get("thoughtSignature").or_else(|| delta.get("signature")).and_then(Value::as_str) {
+                let mut current = self.text.thought_signature.clone().unwrap_or_default();
+                current.push_str(sig);
+                self.text.thought_signature = Some(current);
+            }
+
             if let Some(reasoning) = chat_delta_reasoning_text(delta) {
                 self.push_reasoning_delta_into(&reasoning, output);
             }
@@ -1336,6 +1359,11 @@ impl ChatSseState {
             if !args_delta.is_empty() {
                 state.arguments.push_str(&args_delta);
             }
+            if let Some(sig) = tool_call.get("thoughtSignature").or_else(|| tool_call.get("signature")).and_then(Value::as_str) {
+                let mut current = state.thought_signature.clone().unwrap_or_default();
+                current.push_str(sig);
+                state.thought_signature = Some(current);
+            }
 
             if !state.added && (!state.call_id.is_empty() || !state.name.is_empty()) {
                 should_add = true;
@@ -1475,6 +1503,9 @@ impl ChatSseState {
         if !self.text.added || self.text.done {
             return;
         }
+        if let Some(sig) = self.text.thought_signature.clone() {
+            cache_thought_signature(&text_content_key(&self.text.text), &sig);
+        }
         let output_index = self.text.output_index.unwrap_or(0);
         let item = json!({
             "id": self.text.item_id,
@@ -1547,6 +1578,9 @@ impl ChatSseState {
 
             let state = self.tools.get_mut(&key).expect("tool state exists");
             let output_index = state.output_index.unwrap_or(0);
+            if let Some(sig) = state.thought_signature.clone() {
+                cache_thought_signature(&state.call_id, &sig);
+            }
             let item = tool_call_done_item(state, &self.tool_context);
             state.done = true;
             self.output_items.push((output_index, item.clone()));
@@ -1840,14 +1874,18 @@ fn append_responses_item(
                 return;
             }
             seen_tool_call_ids.insert(call_id.to_string());
-            pending_tool_calls.push(json!({
+            let mut function_obj = json!({
                 "id": call_id,
                 "type": "function",
                 "function": {
                     "name": name,
                     "arguments": responses_arguments_to_chat(item.get("arguments").unwrap_or(&json!({})))
                 }
-            }));
+            });
+            if let Some(sig) = get_thought_signature(call_id) {
+                function_obj["thoughtSignature"] = json!(sig);
+            }
+            pending_tool_calls.push(function_obj);
         }
         Some("function_call_output") => {
             let call_id = item.get("call_id").and_then(Value::as_str).unwrap_or("");
@@ -1886,14 +1924,18 @@ fn append_responses_item(
                 return;
             }
             seen_tool_call_ids.insert(call_id.to_string());
-            pending_tool_calls.push(json!({
+            let mut function_obj = json!({
                 "id": call_id,
                 "type": "function",
                 "function": {
                     "name": name,
                     "arguments": arguments
                 }
-            }));
+            });
+            if let Some(sig) = get_thought_signature(call_id) {
+                function_obj["thoughtSignature"] = json!(sig);
+            }
+            pending_tool_calls.push(function_obj);
         }
         Some("custom_tool_call_output") => {
             let call_id = item.get("call_id").and_then(Value::as_str).unwrap_or("");
@@ -1928,14 +1970,18 @@ fn append_responses_item(
                     return;
                 }
                 seen_tool_call_ids.insert(call_id.to_string());
-                pending_tool_calls.push(json!({
+                let mut function_obj = json!({
                     "id": call_id,
                     "type": "function",
                     "function": {
                         "name": tool_use.get("name").and_then(Value::as_str).unwrap_or(""),
                         "arguments": responses_arguments_to_chat(tool_use.get("input").unwrap_or(&json!({})))
                     }
-                }));
+                });
+                if let Some(sig) = get_thought_signature(call_id) {
+                    function_obj["thoughtSignature"] = json!(sig);
+                }
+                pending_tool_calls.push(function_obj);
             }
         }
         Some("tool_result") => {
@@ -1973,14 +2019,22 @@ fn append_responses_item(
             flush_tool_calls(messages, pending_tool_calls, pending_reasoning);
             if item.get("role").is_some() || item.get("content").is_some() {
                 let role = responses_role_to_chat_role(item.get("role").and_then(Value::as_str));
-                let mut message = json!({
-                    "role": role,
-                    "content": responses_content_to_chat_content(
+                let chat_content = responses_content_to_chat_content(
                         role,
                         item.get("content").unwrap_or(&Value::Null)
-                        )
+                );
+                let mut message = json!({
+                    "role": role,
+                    "content": chat_content.clone()
                 });
                 if role == "assistant" {
+                    if let Some(content_str) = chat_content.as_str() {
+                        if !content_str.is_empty() {
+                            if let Some(sig) = get_thought_signature(&text_content_key(content_str)) {
+                                message["thoughtSignature"] = json!(sig);
+                            }
+                        }
+                    }
                     if !pending_reasoning.is_empty() && pending_tool_calls.is_empty() {
                         message["reasoning_content"] =
                             json!(std::mem::take(pending_reasoning).join("\n"));
@@ -3952,4 +4006,40 @@ fn is_openai_o_series(model: &str) -> bool {
             .as_bytes()
             .get(1)
             .is_some_and(|byte| byte.is_ascii_digit())
+}
+
+static THOUGHT_SIGNATURE_CACHE: std::sync::OnceLock<std::sync::Mutex<Vec<(String, String)>>> = std::sync::OnceLock::new();
+
+fn thought_signature_cache() -> &'static std::sync::Mutex<Vec<(String, String)>> {
+    THOUGHT_SIGNATURE_CACHE.get_or_init(|| std::sync::Mutex::new(Vec::with_capacity(1000)))
+}
+
+fn cache_thought_signature(key: &str, signature: &str) {
+    if key.is_empty() || signature.is_empty() {
+        return;
+    }
+    if let Ok(mut cache) = thought_signature_cache().lock() {
+        if let Some(idx) = cache.iter().position(|(k, _)| k == key) {
+            cache.remove(idx);
+        }
+        if cache.len() >= 1000 {
+            cache.remove(0);
+        }
+        cache.push((key.to_string(), signature.to_string()));
+    }
+}
+
+fn get_thought_signature(key: &str) -> Option<String> {
+    if let Ok(cache) = thought_signature_cache().lock() {
+        cache.iter().rfind(|(k, _)| k == key).map(|(_, v)| v.clone())
+    } else {
+        None
+    }
+}
+
+fn text_content_key(text: &str) -> String {
+    use sha2::{Sha256, Digest};
+    let mut hasher = Sha256::new();
+    hasher.update(text.as_bytes());
+    format!("txt_{:x}", hasher.finalize())
 }
